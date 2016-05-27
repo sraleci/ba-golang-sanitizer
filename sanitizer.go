@@ -10,7 +10,7 @@ import (
 	"strings"
 	"log"
 	"flag"
-	"fmt"
+//	"fmt"
 )
 
 const (
@@ -22,9 +22,16 @@ const (
 
 type format int
 
+type mediaInfo struct {
+	imageMap      map[format]map[int]map[int][]string // map[format,x,y] -> [fileNames, ...]
+	nonMediaPaths []string
+}
+
+
 func main() {
 	source := flag.String("source", "", "Define the source of existing media to be sanitized")
 	target := flag.String("target", "", "Define the target for sanitized media to be created")
+	throttle := flag.Int("throttle", 0, "Define the buffer size for concurrent image reads/writes")
 	flag.Parse()
 
 	if *source == "" {
@@ -35,7 +42,98 @@ func main() {
 		log.Fatal("Target for sanitized media is required")
 	}
 
-	fmt.Printf("Hooray, we got here and nothing exploded: source = %s, target = %s", *source, *target)
+	// Check if source directory exists, want it to be a directory
+	sourceInfo, err := os.Stat(*source)
+	if err != nil {
+		log.Fatal("Ensure that source exists")
+	}
+
+	if !sourceInfo.IsDir() {
+		log.Fatal("Ensure that source is a directory")
+	}
+
+	sourceFile, err := os.Open(*source)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer sourceFile.Close()
+
+	// Check if target directory already exists, fatal if it already exists
+	targetFile, _ := os.Open(*target)
+	if targetFile != nil {
+		log.Fatal("Target already exists")
+	}
+
+	// Begin recursive read of source media
+	c := make(chan int, *throttle)
+	info := mediaInfo{
+		imageMap: make(map[format]map[int]map[int][]string),
+		nonMediaPaths: make([]string, 0),
+	}
+
+	// go readFile(*sourceFile, c, &info)
+	readFile(*sourceFile, c, &info)
+
+	// <-c // causes deadlock - added in order to see go routines finish
+}
+
+func readFile(file os.File, c chan int, info *mediaInfo) {
+	fileInfo, err := file.Stat()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fileName := file.Name()
+	if fileInfo.IsDir() {
+		children, err := file.Readdirnames(0)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for _, child := range children {
+			childFile, err := os.Open(fileName + string(os.PathSeparator) + child)
+			if err != nil {
+				log.Fatal(err)
+			}
+			// go readFile(*childFile, c, info)
+			readFile(*childFile, c, info)
+		}
+	} else {
+		img, err := openImage(&file)
+		if err != nil {
+			if (*info).nonMediaPaths == nil {
+				(*info).nonMediaPaths = make([]string, 0)
+			}
+			(*info).nonMediaPaths = append((*info).nonMediaPaths, fileName)
+		} else {
+			fileFormat := getFormat(fileName)
+			x, y := imageResolution(img)
+
+			formatMap := (*info).imageMap
+			if formatMap == nil {
+				formatMap = make(map[format]map[int]map[int][]string)
+				(*info).imageMap = formatMap
+			}
+
+			xMap := formatMap[fileFormat]
+			if xMap == nil {
+				xMap = make(map[int]map[int][]string)
+				formatMap[fileFormat] = xMap
+			}
+
+			yMap := xMap[x]
+			if yMap == nil {
+				yMap = make(map[int][]string)
+				xMap[x] = yMap
+			}
+
+			fileList := yMap[y]
+			if fileList == nil {
+				fileList = make([]string, 0)
+			}
+
+			yMap[y] = append(fileList, fileName)
+		}
+	}
 }
 
 func writeMinimalImage(x, y int, file string) {
@@ -44,7 +142,7 @@ func writeMinimalImage(x, y int, file string) {
 		log.Fatal(err)
 	}
 
-	image := image.NewGray(image.Rect(0,0,x,y))
+	image := image.NewGray(image.Rect(0, 0, x, y))
 
 	switch getFormat(file) {
 	case pngFormat:
@@ -71,14 +169,8 @@ func imageResolution(img image.Image) (int, int) {
 	return max.X - min.X, max.Y - min.Y
 }
 
-func openImage(file string) (image.Image, error) {
-	reader, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-
-	switch getFormat(file) {
+func openImage(reader *os.File) (image.Image, error) {
+	switch getFormat(reader.Name()) {
 	case pngFormat:
 		return png.Decode(reader)
 	case gifFormat:
