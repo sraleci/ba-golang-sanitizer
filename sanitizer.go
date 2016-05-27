@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"log"
+	"flag"
+	"fmt"
 )
 
 const (
@@ -21,9 +23,19 @@ const (
 type format int
 
 func main() {
-	writeMinimalImage(7000, 3000, "new.gif")
-	writeMinimalImage(4000, 2000, "new.jpg")
-	writeMinimalImage(5000, 10000, "new.png")
+	source := flag.String("source", "", "Define the source of existing media to be sanitized")
+	target := flag.String("target", "", "Define the target for sanitized media to be created")
+	flag.Parse()
+
+	if *source == "" {
+		log.Fatal("Existing media source is required")
+	}
+
+	if *target == "" {
+		log.Fatal("Target for sanitized media is required")
+	}
+
+	fmt.Printf("Hooray, we got here and nothing exploded: source = %s, target = %s", *source, *target)
 }
 
 func writeMinimalImage(x, y int, file string) {
