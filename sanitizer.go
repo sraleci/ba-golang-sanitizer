@@ -10,7 +10,8 @@ import (
 	"strings"
 	"log"
 	"flag"
-//	"fmt"
+	"fmt"
+	"io"
 )
 
 const (
@@ -20,19 +21,24 @@ const (
 	pngFormat
 )
 
+const fileMode = 0777
+
 type format int
 
-type mediaInfo struct {
-	imageMap      map[format]map[int]map[int][]string // map[format,x,y] -> [fileNames, ...]
-	nonMediaPaths []string
-}
+type imageMap map[format]map[int]map[int][]string // map[format,x,y] -> [fileNames, ...]
 
+var (
+	verbose bool
+	targetSanitized string
+)
 
 func main() {
 	source := flag.String("source", "", "Define the source of existing media to be sanitized")
 	target := flag.String("target", "", "Define the target for sanitized media to be created")
 	throttle := flag.Int("throttle", 0, "Define the buffer size for concurrent image reads/writes")
+	verboseFlag := flag.Bool("verbose", false, "Define logging behavior")
 	flag.Parse()
+	verbose = *verboseFlag
 
 	if *source == "" {
 		log.Fatal("Existing media source is required")
@@ -61,23 +67,69 @@ func main() {
 	// Check if target directory already exists, fatal if it already exists
 	targetFile, _ := os.Open(*target)
 	if targetFile != nil {
+		targetFile.Close()
 		log.Fatal("Target already exists")
 	}
+	targetSanitized = *target + string(os.PathSeparator) + ".sanitized" + string(os.PathSeparator)
+	os.MkdirAll(targetSanitized, fileMode)
 
 	// Begin recursive read of source media
 	c := make(chan int, *throttle)
-	info := mediaInfo{
-		imageMap: make(map[format]map[int]map[int][]string),
-		nonMediaPaths: make([]string, 0),
-	}
+	info := make(imageMap)
 
 	// go readFile(*sourceFile, c, &info)
-	readFile(*sourceFile, c, &info)
+	readFile(*sourceFile, c, &info, *source, *target)
+
+	// Write minimal images for all unique formats and resolutions
+	for imageFormat, xMap := range info {
+		for x, yMap := range xMap {
+			for y, _ := range yMap {
+				targetFile, err := getMinimalFileName(x, y, imageFormat)
+				if err == nil {
+					if verbose {
+						fmt.Printf("Creating sanitized image file %s\n", targetFile)
+					}
+					writeMinimalImage(x, y, targetFile)
+				}
+			}
+		}
+	}
+
+	// Link image files to the minimal images
+	for imageFormat, xMap := range info {
+		for x, yMap := range xMap {
+			for y, fileList := range yMap {
+				for _, file := range fileList {
+					targetFile, err := getMinimalFileName(x, y, imageFormat)
+					if err == nil {
+						oldFile := strings.Replace(file, *source, *target, -1)
+						if verbose {
+							fmt.Printf("Establishing a hard link from %s to sanitized %s\n", oldFile, targetFile)
+						}
+						os.Link(oldFile, targetFile)
+					}
+				}
+			}
+		}
+	}
 
 	// <-c // causes deadlock - added in order to see go routines finish
 }
 
-func readFile(file os.File, c chan int, info *mediaInfo) {
+func getMinimalFileName(x, y int, imageFormat format) (string, error) {
+	switch imageFormat {
+	case gifFormat:
+		return fmt.Sprintf("%s%dx%d.gif", targetSanitized, x, y), nil
+	case jpegFormat:
+		return fmt.Sprintf("%s%dx%d.jpg", targetSanitized, x, y), nil
+	case pngFormat:
+		return fmt.Sprintf("%s%dx%d.png", targetSanitized, x, y), nil
+	default:
+		return "", errors.New("Unrecognized image extension")
+	}
+}
+
+func readFile(file os.File, c chan int, info *imageMap, source, target string) {
 	fileInfo, err := file.Stat()
 	if err != nil {
 		log.Fatal(err)
@@ -89,35 +141,54 @@ func readFile(file os.File, c chan int, info *mediaInfo) {
 		if err != nil {
 			log.Fatal(err)
 		}
+		fmt.Printf("Children of %s are %v\n", fileName, children)
 		for _, child := range children {
-			childFile, err := os.Open(fileName + string(os.PathSeparator) + child)
-			if err != nil {
-				log.Fatal(err)
-			}
-			// go readFile(*childFile, c, info)
-			readFile(*childFile, c, info)
+			func() {
+				childFile, err := os.Open(fileName + string(os.PathSeparator) + child)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer childFile.Close()
+				// go readFile(*childFile, c, info)
+				readFile(*childFile, c, info, source, target)
+			}()
 		}
 	} else {
 		img, err := openImage(&file)
 		if err != nil {
-			if (*info).nonMediaPaths == nil {
-				(*info).nonMediaPaths = make([]string, 0)
+			// We can go ahead and copy the file if it's not a matching image format
+			targetFile := strings.Replace(fileName, source, target, -1)
+			splitTarget := strings.Split(targetFile, string(os.PathSeparator))
+			targetFileParent := strings.Join(splitTarget[:len(splitTarget)-1], string(os.PathSeparator))
+			_, err := os.Open(targetFileParent)
+			if err != nil {
+				os.MkdirAll(targetFileParent, fileMode)
 			}
-			(*info).nonMediaPaths = append((*info).nonMediaPaths, fileName)
+
+			file.Close()
+			out, err := os.Create(targetFile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer out.Close()
+			in, err := os.Open(fileName)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if _, err = io.Copy(out, in); err != nil {
+				log.Fatal(err)
+			} else if verbose {
+				fmt.Printf("Copied non-image file from %s to %s\n", in.Name(), out.Name())
+			}
+			out.Sync()
 		} else {
 			fileFormat := getFormat(fileName)
 			x, y := imageResolution(img)
 
-			formatMap := (*info).imageMap
-			if formatMap == nil {
-				formatMap = make(map[format]map[int]map[int][]string)
-				(*info).imageMap = formatMap
-			}
-
-			xMap := formatMap[fileFormat]
+			xMap := (*info)[fileFormat]
 			if xMap == nil {
 				xMap = make(map[int]map[int][]string)
-				formatMap[fileFormat] = xMap
+				(*info)[fileFormat] = xMap
 			}
 
 			yMap := xMap[x]
